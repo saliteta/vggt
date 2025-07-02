@@ -13,6 +13,8 @@ from mesh_loader.simple_data_loader import PairedDataset
 from mesh_loader.alignment import align_model_to_gt
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 import datetime
+import argparse
+
 
 # Logging imports
 try:
@@ -29,15 +31,17 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not available. Install with: pip install wandb")
 
-DATASET_DIR = "/home/bxiong/workspace/tile_mesh_rendering/camera/render_0000"
-
+def arg_parse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_dir", type=str, default="/home/bxiong/workspace/tile_mesh_rendering/camera/render_0000")
+    return parser.parse_args()
 
 
 def main():
     global_step = 0
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Training on {device}")
-
+    args = arg_parse()
 
     if TENSORBOARD_AVAILABLE:
         tb_logdir = os.path.join("runs", "vggt_head")
@@ -49,7 +53,7 @@ def main():
         print("Wandb logging to wandb")
 
     # Dataset and DataLoader
-    dataset = PairedDataset("../tile_mesh_rendering/camera/")
+    dataset = PairedDataset(args.dataset_dir)
     loader = DataLoader(dataset,
                         batch_size=1,
                         shuffle=True,
@@ -64,18 +68,6 @@ def main():
     model = model.to(device)
     
 
-    ##images = load_and_preprocess_images(image_path_list).to(device)
-    #point_maps, camera_params, rgb_images = next(iter(loader))
-    #keys = list(point_maps.keys())
-    #keys.sort()
-    #images = []
-    #for key in keys:
-    #    images.append(rgb_images[key])
-    #images = torch.stack(images)
-    #images = images.to(device)
-#
-    #print("Running inference...")
-    #dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
 
 
