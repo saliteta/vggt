@@ -82,7 +82,7 @@ def main():
     head_params += list(model.camera_head.parameters())
     head_params += list(model.point_head.parameters())
 
-    optimizer = optim.Adam(head_params, lr=4e-5)
+    optimizer = optim.Adam(head_params, lr=args.learning_rate)
     criterion = nn.MSELoss()
 
     best_val_loss = float('inf')
