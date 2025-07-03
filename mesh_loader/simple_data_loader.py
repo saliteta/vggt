@@ -11,9 +11,9 @@ import tifffile as tif
 import random
 
 class PairedDataset(Dataset):
-    def __init__(self, data_dir, num_images=3):
+    def __init__(self, data_dir:Path, num_images=3):
         self.data_dir = data_dir
-        self.dataset_meta = os.listdir(self.data_dir)
+        self.dataset_meta = list(self.data_dir.glob("*"))
         self.dataset_meta.sort()
         self.num_images = num_images
     
@@ -86,10 +86,10 @@ class PairedDataset(Dataset):
         return torch.stack(rgb_images)
 
     def __len__(self):
-        return len(os.listdir(self.data_dir))
+        return len(self.dataset_meta)
 
     def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        sequence_path = Path(os.path.join(self.data_dir, self.dataset_meta[idx]))
+        sequence_path = self.dataset_meta[idx]
         camera_path = list(sequence_path.glob("*.json"))[0]
         camera_params = self._load_camera_params(camera_path)
         point_map_path = list(sequence_path.glob("*.tiff"))

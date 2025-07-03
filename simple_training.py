@@ -14,16 +14,7 @@ from mesh_loader.alignment import align_model_to_gt
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 import datetime
 import argparse
-
-
-
-# Logging imports
-try:
-    from torch.utils.tensorboard.writer import SummaryWriter
-    TENSORBOARD_AVAILABLE = True
-except ImportError:
-    TENSORBOARD_AVAILABLE = False
-    print("Warning: tensorboard not available. Install with: pip install tensorboard")
+from pathlib import Path
 
 try:
     import wandb
@@ -34,7 +25,9 @@ except ImportError:
 
 def arg_parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir", type=str, default="/home/bxiong/workspace/tile_mesh_rendering/camera/render_0000")
+    parser.add_argument("--dataset_dir", type=str, default="/media/bxiong/c6deb427-f841-4fb3-8707-2d0593655c63/bingMap")
+    parser.add_argument("--sequence_length", type=int, default=3)
+    parser.add_argument("--learning_rate", type=float, default=4e-5)
     return parser.parse_args()
 
 
@@ -43,23 +36,26 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Training on {device}")
     args = arg_parse()
-
-    if TENSORBOARD_AVAILABLE:
-        tb_logdir = os.path.join("runs", "vggt_head")
-        writer = SummaryWriter(log_dir=tb_logdir)
-        print(f"TensorBoard logging to {tb_logdir}")
+    dataset_dir = Path(args.dataset_dir)
 
     if WANDB_AVAILABLE:
         wandb.init(project="vggt_head", name="vggt_head")
         print("Wandb logging to wandb")
 
     # Dataset and DataLoader
-    dataset = PairedDataset(args.dataset_dir)
-    loader = DataLoader(dataset,
+    train_dataset = PairedDataset(dataset_dir/"train")
+    val_dataset = PairedDataset(dataset_dir/"eval")
+    train_loader = DataLoader(train_dataset,
                         batch_size=1,
                         shuffle=True,
                         num_workers=4,
                         pin_memory=True)
+    val_loader = DataLoader(val_dataset,
+                            batch_size=1,
+                            shuffle=False,
+                            num_workers=4,
+                            pin_memory=True)
+
 
     # Model
     model = VGGT()
@@ -89,11 +85,11 @@ def main():
     optimizer = optim.Adam(head_params, lr=4e-5)
     criterion = nn.MSELoss()
 
-    best_loss = float('inf')
+    best_val_loss = float('inf')
     for epoch in range(1, 100 + 1):
-        model.train()
         running_loss = 0.0
-        for point_maps, camera_params, rgb_images in tqdm(loader, desc=f"Epoch {epoch}"):
+        model.train()
+        for point_maps, camera_params, rgb_images in tqdm(train_loader, desc=f"Epoch {epoch}"):
             gt = {
                 "images": rgb_images.to(device),
                 "extrinsic": camera_params.to(device).squeeze(0),
@@ -116,37 +112,58 @@ def main():
             running_loss += loss.item() * gt["images"].size(0)
             global_step += 1
             
-            if TENSORBOARD_AVAILABLE:
-                writer.add_scalar("train/loss_step", loss.item(), global_step)
+
             if WANDB_AVAILABLE:
                 wandb.log({"train/loss_step": loss.item(), "step": global_step})
-        epoch_loss = running_loss / len(dataset)
-        print(f"Epoch {epoch} loss: {epoch_loss:.6f}")
+        train_loss = running_loss / len(train_dataset)
+        print(f"Epoch {epoch} train loss: {train_loss:.6f}")
+        
+        with torch.no_grad():
+            model.eval()
+            running_loss = 0.0
+            for point_maps, camera_params, rgb_images in tqdm(val_loader, desc=f"Epoch {epoch}"):
+                gt = {
+                    "images": rgb_images.to(device),
+                    "extrinsic": camera_params.to(device).squeeze(0),
+                    "world_points": point_maps.to(device).squeeze(0)    
+                }
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    preds = model(gt["images"])
+                predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
+                preds["extrinsic"] = predict_extrinsics.squeeze(0)
+                preds["world_points"] = preds["world_points"].squeeze(0)    
+                preds = align_model_to_gt(preds, gt)
+                loss_pose = criterion(preds["extrinsic"], gt["extrinsic"])
+                loss_pts  = criterion(preds["world_points"], gt["world_points"].reshape(-1, 3))
+                loss = loss_pose + loss_pts
+                running_loss += loss.item() * gt["images"].size(0)
+            val_loss = running_loss / len(val_dataset)
+            print(f"Epoch {epoch} val loss: {val_loss:.6f}")
 
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save({'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': best_loss}, "model_save/best_model.pth")
+                        'loss': best_val_loss}, "model_save/best_model.pth")
             print(f"Saved best model to best_model.pth")
         # --- log per-epoch ---
-        print(f"Epoch {epoch} loss: {epoch_loss:.6f}")
-        if TENSORBOARD_AVAILABLE:
-            writer.add_scalar("train/loss_epoch", epoch_loss, epoch)
+        print(f"Epoch {epoch} train loss: {train_loss:.6f}, val loss: {val_loss:.6f}")
+
         if WANDB_AVAILABLE:
-            wandb.log({"train/loss_epoch": epoch_loss, "epoch": epoch})
+            wandb.log({"train/loss_epoch": train_loss, "epoch": epoch})
+            wandb.log({"val/loss_epoch": val_loss, "epoch": epoch})
 
         # --- save best ---
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             os.makedirs("model_save", exist_ok=True)
             ckpt_path = "model_save/best_model.pth"
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "loss": best_loss
+                "loss": best_val_loss
             }, ckpt_path)
             print(f"Saved best model to {ckpt_path}")
             if WANDB_AVAILABLE:
@@ -155,8 +172,6 @@ def main():
     # ----------------------------------------------------------------
     # 5) Wrap up
     # ----------------------------------------------------------------
-    if TENSORBOARD_AVAILABLE:
-        writer.close()
     if WANDB_AVAILABLE:
         wandb.finish()
     print("Training complete.")
