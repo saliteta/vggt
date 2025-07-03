@@ -45,5 +45,5 @@ fi
 mkdir -p logs
 
 
-echo "[`date +'%Y-%m-%d %H:%M:%S'`] 
+echo "[`date +'%Y-%m-%d %H:%M:%S'`] Starting training..."
 python simple_training.py  --dataset_dir ${INPUT_LOCATION}

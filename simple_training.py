@@ -69,6 +69,8 @@ def main():
     
 
 
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
 
 
 
@@ -109,7 +111,7 @@ def main():
 
             optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.cuda.amp.autocast(dtype=dtype):
                 preds = model(gt["images"])
             predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
             preds["extrinsic"] = predict_extrinsics.squeeze(0)
