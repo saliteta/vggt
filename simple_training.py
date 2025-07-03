@@ -43,8 +43,8 @@ def main():
         print("Wandb logging to wandb")
 
     # Dataset and DataLoader
-    train_dataset = PairedDataset(dataset_dir/"train")
-    val_dataset = PairedDataset(dataset_dir/"eval")
+    train_dataset = PairedDataset(dataset_dir/"train",num_images=args.sequence_length)
+    val_dataset = PairedDataset(dataset_dir/"eval",num_images=args.sequence_length)
     train_loader = DataLoader(train_dataset,
                         batch_size=1,
                         shuffle=True,
