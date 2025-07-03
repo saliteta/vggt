@@ -6,22 +6,24 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import tifffile as tif
+import random
 
 class PairedDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, num_images=3):
         self.data_dir = data_dir
         self.dataset_meta = os.listdir(self.data_dir)
         self.dataset_meta.sort()
+        self.num_images = num_images
     
-    def _load_point_maps(self, points_path: List[Path]) -> Dict[str, torch.Tensor]:
-        point_maps = {}
+    def _load_point_maps(self, points_path: List[Path]) -> torch.Tensor:
+        point_maps = []
         for path in points_path:
             point_map = tif.imread(str(path))
             point_map_tensor = torch.from_numpy(point_map)
-            point_maps[path.stem.replace("_pointmap", "")] = point_map_tensor
-        return point_maps
+            point_maps.append(point_map_tensor)
+        return torch.stack(point_maps)
 
     def _load_camera_params(self, camera_path: Path) -> Dict[str, torch.Tensor]:
         with open(camera_path, "r") as f:
@@ -39,24 +41,21 @@ class PairedDataset(Dataset):
             
         return camera_transforms
     
-    def _transform_to_first_camera_coordinates(self, camera_transforms: Dict[str, torch.Tensor], point_maps: Dict[str, torch.Tensor]):
+    def _transform_to_first_camera_coordinates(self, camera_transforms: torch.Tensor, point_maps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Assume each camera_transforms[k] is a 4×4 world→cameraₖ matrix.
-        keys = list(camera_transforms.keys())
-        keys.sort()
-        first_key = keys[0]
-        E0 = camera_transforms[first_key].T             # world→camera₀
+        E0 = camera_transforms[0].T             # world→camera₀
         E0_inv = torch.inverse(E0)
 
         # 1) Transform all point-maps into camera₀-frame:
-        aligned_points = {}
+        aligned_points = []
         all_pts = []
-        for k, pts in point_maps.items():
+        for pts in point_maps:
             H, W, _ = pts.shape
             flat = pts.reshape(-1, 3)
             ones = torch.ones(flat.shape[0], 1, device=flat.device, dtype=flat.dtype)
             hom = torch.cat([flat, ones], dim=1)      # (N,4)
             cam0 = (E0 @ hom.T).T[:, :3]              # (N,3)
-            aligned_points[k] = cam0.reshape(H, W, 3)
+            aligned_points.append(cam0.reshape(H, W, 3))
             all_pts.append(cam0)
 
 
@@ -65,44 +64,55 @@ class PairedDataset(Dataset):
         max_dist = all_pts.norm(dim=1).max()
 
         # 3) Scale point-maps and camera translations:
-        for k in aligned_points:
-            aligned_points[k] /= max_dist
+        for i in range(len(aligned_points)):
+            aligned_points[i] /= max_dist
 
-        aligned_cams = {}
-        for k, E_i in camera_transforms.items():
+        aligned_cams = []
+        for E_i in camera_transforms:
             # express cameraᵢ in cam₀ frame
             E_i_cam0 = E_i.T @ E0_inv
             # scale translation part
             E_i_cam0[:3, 3] /= max_dist
-            aligned_cams[k] = E_i_cam0
+            aligned_cams.append(E_i_cam0)
 
-
-
-        return aligned_cams, aligned_points
+        return torch.stack(aligned_cams), torch.stack(aligned_points)
             
-    def _load_rgb_image(self, rgb_image_path: List[Path]) -> Dict[str, torch.Tensor]:
-        rgb_images = {}
+    def _load_rgb_image(self, rgb_image_path: List[Path]) -> torch.Tensor:
+        rgb_images = []
         for path in rgb_image_path:
             rgb_image = Image.open(str(path))
             rgb_image_tensor = torch.from_numpy(np.array(rgb_image))
-            rgb_images[path.stem] = rgb_image_tensor[:,:,:3].permute(2,0,1) / 255.0 # remove alpha channel
-        return rgb_images
+            rgb_images.append(rgb_image_tensor[:,:,:3].permute(2,0,1) / 255.0) # remove alpha channel
+        return torch.stack(rgb_images)
 
     def __len__(self):
         return len(os.listdir(self.data_dir))
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sequence_path = Path(os.path.join(self.data_dir, self.dataset_meta[idx]))
         camera_path = list(sequence_path.glob("*.json"))[0]
+        camera_params = self._load_camera_params(camera_path)
         point_map_path = list(sequence_path.glob("*.tiff"))
         rgb_image_path = list(sequence_path.glob("*.png"))
-
+        
         point_map_path.sort()
         rgb_image_path.sort()
 
-        camera_params = self._load_camera_params(camera_path)
+        num_images = min(self.num_images, len(point_map_path))
+        shuffled_indices = random.sample(range(len(point_map_path)), num_images)
+
+        camera_keys = list(camera_params.keys())
+        camera_keys.sort()
+        camera_keys = [camera_keys[i] for i in shuffled_indices]
+
+
+        point_map_path = [point_map_path[i] for i in shuffled_indices]
+        rgb_image_path = [rgb_image_path[i] for i in shuffled_indices]
+
         point_maps = self._load_point_maps(point_map_path)
         rgb_images = self._load_rgb_image(rgb_image_path)
+        camera_params = torch.stack([camera_params[k] for k in camera_keys])
+
 
         # Transform everything to use first camera as reference coordinate system
         transformed_cameras, transformed_point_maps = self._transform_to_first_camera_coordinates(camera_params, point_maps)
@@ -150,3 +160,11 @@ def from_gt(transformed_point_maps, transformed_cameras, rgb_images):
             gt[key] = gt[key].cuda()  # remove batch dimension and convert to numpy
 
     return gt
+
+
+if __name__ == "__main__":
+    dataset = PairedDataset("./dataset")
+
+    point_maps, camera_params, rgb_images = dataset[0]
+    print(camera_params[1].shape)
+    print(camera_params[1,:3,:])

@@ -16,6 +16,7 @@ import datetime
 import argparse
 
 
+
 # Logging imports
 try:
     from torch.utils.tensorboard.writer import SummaryWriter
@@ -93,24 +94,14 @@ def main():
         model.train()
         running_loss = 0.0
         for point_maps, camera_params, rgb_images in tqdm(loader, desc=f"Epoch {epoch}"):
-            keys = list(point_maps.keys())
-            keys.sort()
-            images = []
-            gt_extrinsics = []
-            gt_points = []
-            for key in keys:
-                images.append(rgb_images[key])
-                gt_extrinsics.append(camera_params[key])
-                gt_points.append(point_maps[key])
             gt = {
-                "images": torch.stack(images).to(device).squeeze(1),
-                "extrinsic": torch.stack(gt_extrinsics).to(device).squeeze(1),
-                "world_points": torch.stack(gt_points).to(device).squeeze(1)
+                "images": rgb_images.to(device),
+                "extrinsic": camera_params.to(device).squeeze(0),
+                "world_points": point_maps.to(device).squeeze(0)
             }
 
 
             optimizer.zero_grad()
-            
             with torch.cuda.amp.autocast(dtype=dtype):
                 preds = model(gt["images"])
             predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
