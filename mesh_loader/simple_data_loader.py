@@ -10,12 +10,59 @@ from typing import Dict, List, Tuple
 import tifffile as tif
 import random
 
+M = torch.diag(torch.tensor([1, -1, 1])) 
+
+
+def pytorch3d_to_colmap_batch(camera_params: torch.Tensor,
+                              point_maps: torch.Tensor,
+                              rgb_images: torch.Tensor
+                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Batch‐wise conversion from PyTorch3D conventions to COLMAP conventions:
+      - camera_params: (B, 4, 4) world→camera transforms in PyTorch3D coords
+      - point_maps:    (B, H, W, 3) 3D point coordinates in PyTorch3D world
+      - rgb_images:    (B, H, W, 3) RGB images (unchanged)
+    Returns:
+      - T_colmap:      (B, 4, 4) world→camera transforms in COLMAP/OpenCV coords
+      - point_maps:    (B, H, W, 3) rotated point maps in COLMAP coords
+      - rgb_images:    unchanged
+    """
+    device = camera_params.device
+    dtype = camera_params.dtype
+    B, H, W, _ = point_maps.shape
+
+    # 1) Define the Y‐axis flip matrix (PyTorch3D Y‐up → COLMAP Y‐down)
+    M3 = torch.diag(torch.tensor([1, -1, 1], dtype=dtype, device=device))
+
+    # 2) Extract R and t from the 4×4 transforms
+    R_py3d = camera_params[:, :3, :3]  # (B, 3, 3)
+    t_py3d = camera_params[:, :3, 3]   # (B, 3)
+
+    # 3) Convert each: R_colmap = M3 @ R_py3d @ M3, t_colmap = M3 @ t_py3d
+    R_colmap = M3 @ R_py3d @ M3  # broadcast M3 over batch
+    t_colmap = (M3 @ t_py3d.unsqueeze(-1)).squeeze(-1)  # (B,3)
+
+    # 4) Build full 4×4 COLMAP transforms
+    T_colmap = torch.eye(4, dtype=dtype, device=device)\
+        .unsqueeze(0).repeat(B, 1, 1)   # (B,4,4)
+    T_colmap[:, :3, :3] = R_colmap
+    T_colmap[:, :3, 3]    = t_colmap
+
+    # 5) Rotate point maps by M3
+    pts_flat = point_maps.reshape(-1, 3).T     # (3, B*H*W)
+    pts_rot  = (M3 @ pts_flat).T               # (B*H*W, 3)
+    pts_new  = pts_rot.reshape(B, H, W, 3)     # (B, H, W, 3)
+
+    return pts_new, T_colmap, rgb_images
+
+
 class PairedDataset(Dataset):
-    def __init__(self, data_dir:Path, num_images=3):
+    def __init__(self, data_dir:Path, num_images=3, data_conversion=None):
         self.data_dir = data_dir
         self.dataset_meta = list(self.data_dir.glob("*"))
         self.dataset_meta.sort()
         self.num_images = num_images
+        self.data_conversion = data_conversion
     
     def _load_point_maps(self, points_path: List[Path]) -> torch.Tensor:
         point_maps = []
@@ -115,8 +162,14 @@ class PairedDataset(Dataset):
 
 
         # Transform everything to use first camera as reference coordinate system
+
         transformed_cameras, transformed_point_maps = self._transform_to_first_camera_coordinates(camera_params, point_maps)
-        return transformed_point_maps, transformed_cameras, rgb_images
+        if self.data_conversion == None:
+            return transformed_point_maps, transformed_cameras, rgb_images
+        else:
+            print(transformed_cameras)
+            return self.data_conversion(transformed_cameras, transformed_point_maps, rgb_images)
+
 
 class PairedDataLoader(DataLoader):
     def __init__(self, dataset, batch_size=1, shuffle=False, num_workers=0):
@@ -132,7 +185,6 @@ class PairedDataLoader(DataLoader):
             # For larger batches, you'd need to implement proper batching logic
             # This is more complex with dictionaries, so keeping simple for now
             return batch    
-
 
 
 def from_gt(transformed_point_maps, transformed_cameras, rgb_images):
@@ -163,8 +215,14 @@ def from_gt(transformed_point_maps, transformed_cameras, rgb_images):
 
 
 if __name__ == "__main__":
-    dataset = PairedDataset("./dataset")
+    dataset = PairedDataset(Path("/media/bxiong/c6deb427-f841-4fb3-8707-2d0593655c63/bingMap/train"), data_conversion=pytorch3d_to_colmap_batch)
 
     point_maps, camera_params, rgb_images = dataset[0]
-    print(camera_params[1].shape)
-    print(camera_params[1,:3,:])
+    print(camera_params)
+    preds = {
+        "world_points": point_maps.cpu().numpy(),
+        "extrinsic": camera_params.cpu().numpy(),
+        "images": rgb_images.cpu().numpy(),
+    }
+    from visualizer import viser_wrapper
+    viser_wrapper(preds)

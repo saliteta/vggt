@@ -1,216 +1,201 @@
-import numpy as np
-import torch
-from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
 import os
 import glob
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from simple_data_loader import PairedDataset
-from plyfile import PlyData, PlyElement
-from alignment import align_model_to_gt
+import time
+import threading
+import argparse
+from typing import List, Optional
 
-def closed_form_inverse_se3(se3, R=None, T=None):
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+import viser
+import viser.transforms as viser_tf
+from vggt.utils.geometry import closed_form_inverse_se3
+
+
+def viser_wrapper(
+    pred_dict: dict,
+    port: int = 8080,
+    background_mode: bool = False,
+):
     """
-    Compute the inverse of each 4x4 (or 3x4) SE3 matrix in a batch.
-
-    If `R` and `T` are provided, they must correspond to the rotation and translation
-    components of `se3`. Otherwise, they will be extracted from `se3`.
+    Visualize predicted 3D points and camera poses with viser.
 
     Args:
-        se3: Nx4x4 or Nx3x4 array or tensor of SE3 matrices.
-        R (optional): Nx3x3 array or tensor of rotation matrices.
-        T (optional): Nx3x1 array or tensor of translation vectors.
-
-    Returns:
-        Inverted SE3 matrices with the same type and device as `se3`.
-
-    Shapes:
-        se3: (N, 4, 4)
-        R: (N, 3, 3)
-        T: (N, 3, 1)
+        pred_dict (dict):
+            {
+                "images": (S, 3, H, W)   - Input images,
+                "world_points": (S, H, W, 3),
+                "world_points_conf": (S, H, W),
+                "depth": (S, H, W, 1),
+                "depth_conf": (S, H, W),
+                "extrinsic": (S, 3, 4),
+                "intrinsic": (S, 3, 3),
+            }
+        port (int): Port number for the viser server.
+        init_conf_threshold (float): Initial percentage of low-confidence points to filter out.
+        use_point_map (bool): Whether to visualize world_points or use depth-based points.
+        background_mode (bool): Whether to run the server in background thread.
+        mask_sky (bool): Whether to apply sky segmentation to filter out sky points.
+        image_folder (str): Path to the folder containing input images.
     """
-    # Check if se3 is a numpy array or a torch tensor
-    is_numpy = isinstance(se3, np.ndarray)
+    print(f"Starting viser server on port {port}")
 
-    # Validate shapes
-    if se3.shape[-2:] != (4, 4) and se3.shape[-2:] != (3, 4):
-        raise ValueError(f"se3 must be of shape (N,4,4), got {se3.shape}.")
+    server = viser.ViserServer(host="0.0.0.0", port=port)
+    server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
-    # Extract R and T if not provided
-    if R is None:
-        R = se3[:, :3, :3]  # (N,3,3)
-    if T is None:
-        T = se3[:, :3, 3:]  # (N,3,1)
+    # Unpack prediction dict
+    images = pred_dict["images"]  # (S, 3, H, W)
+    world_points_map = pred_dict["world_points"]  # (S, H, W, 3)
 
-    # Transpose R
-    if is_numpy:
-        # Compute the transpose of the rotation for NumPy
-        R_transposed = np.transpose(R, (0, 2, 1))
-        # -R^T t for NumPy
-        top_right = -np.matmul(R_transposed, T)
-        inverted_matrix = np.tile(np.eye(4), (len(R), 1, 1))
+    extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4)
+
+    # Compute world points from depth if not using the precomputed point map
+
+    world_points = world_points_map
+
+    # Convert images from (S, 3, H, W) to (S, H, W, 3)
+    # Then flatten everything for the point cloud
+    colors = images.transpose(0, 2, 3, 1)  # now (S, H, W, 3)
+    S, H, W, _ = world_points.shape
+
+    # Flatten
+    points = world_points.reshape(-1, 3)
+    colors_flat = (colors.reshape(-1, 3) * 255).astype(np.uint8)
+
+    cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) typically
+    # For convenience, we store only (3,4) portion
+    cam_to_world = cam_to_world_mat[:, :3, :]
+
+    # Compute scene center and recenter
+    scene_center = np.mean(points, axis=0)
+    points_centered = points - scene_center
+    cam_to_world[..., -1] -= scene_center
+
+    # Store frame indices so we can filter by frame
+    frame_indices = np.repeat(np.arange(S), H * W)
+
+    # Build the viser GUI
+    gui_show_frames = server.gui.add_checkbox("Show Cameras", initial_value=True)
+
+
+    gui_frame_selector = server.gui.add_dropdown(
+        "Show Points from Frames", options=["All"] + [str(i) for i in range(S)], initial_value="All"
+    )
+
+    # Create the main point cloud handle
+    # Compute the threshold value as the given percentile
+    point_cloud = server.scene.add_point_cloud(
+        name="viser_pcd",
+        points=points_centered,
+        colors=colors_flat,
+        point_size=0.001,
+        point_shape="circle",
+    )
+
+    # We will store references to frames & frustums so we can toggle visibility
+    frames: List[viser.FrameHandle] = []
+    frustums: List[viser.CameraFrustumHandle] = []
+
+    def visualize_frames(extrinsics: np.ndarray, images_: np.ndarray) -> None:
+        """
+        Add camera frames and frustums to the scene.
+        extrinsics: (S, 3, 4)
+        images_:    (S, 3, H, W)
+        """
+        # Clear any existing frames or frustums
+        for f in frames:
+            f.remove()
+        frames.clear()
+        for fr in frustums:
+            fr.remove()
+        frustums.clear()
+
+        # Optionally attach a callback that sets the viewpoint to the chosen camera
+        def attach_callback(frustum: viser.CameraFrustumHandle, frame: viser.FrameHandle) -> None:
+            @frustum.on_click
+            def _(_) -> None:
+                for client in server.get_clients().values():
+                    client.camera.wxyz = frame.wxyz
+                    client.camera.position = frame.position
+
+        img_ids = range(S)
+        for img_id in tqdm(img_ids):
+            cam2world_3x4 = extrinsics[img_id]
+            T_world_camera = viser_tf.SE3.from_matrix(cam2world_3x4)
+
+            # Add a small frame axis
+            frame_axis = server.scene.add_frame(
+                f"frame_{img_id}",
+                wxyz=T_world_camera.rotation().wxyz,
+                position=T_world_camera.translation(),
+                axes_length=0.05,
+                axes_radius=0.002,
+                origin_radius=0.002,
+            )
+            frames.append(frame_axis)
+
+            # Convert the image for the frustum
+            img = images_[img_id]  # shape (3, H, W)
+            img = (img.transpose(1, 2, 0) * 255).astype(np.uint8)
+            h, w = img.shape[:2]
+
+            # If you want correct FOV from intrinsics, do something like:
+            # fx = intrinsics_cam[img_id, 0, 0]
+            # fov = 2 * np.arctan2(h/2, fx)
+            # For demonstration, we pick a simple approximate FOV:
+            fy = 1.1 * h
+            fov = 2 * np.arctan2(h / 2, fy)
+
+            # Add the frustum
+            frustum_cam = server.scene.add_camera_frustum(
+                f"frame_{img_id}/frustum", fov=fov, aspect=w / h, scale=0.05, image=img, line_width=1.0
+            )
+            frustums.append(frustum_cam)
+            attach_callback(frustum_cam, frame_axis)
+
+    def update_point_cloud() -> None:
+        """Update the point cloud based on current GUI selections."""
+
+
+        selected_idx = int(gui_frame_selector.value)
+        frame_mask = frame_indices == selected_idx
+
+        combined_mask = frame_mask
+        point_cloud.points = points_centered[combined_mask]
+        point_cloud.colors = colors_flat[combined_mask]
+
+    @gui_frame_selector.on_update
+    def _(_) -> None:
+        update_point_cloud()
+
+    @gui_show_frames.on_update
+    def _(_) -> None:
+        """Toggle visibility of camera frames and frustums."""
+        for f in frames:
+            f.visible = gui_show_frames.value
+        for fr in frustums:
+            fr.visible = gui_show_frames.value
+
+    # Add the camera frames to the scene
+    visualize_frames(cam_to_world, images)
+
+    print("Starting viser server...")
+    # If background_mode is True, spawn a daemon thread so the main thread can continue.
+    if background_mode:
+
+        def server_loop():
+            while True:
+                time.sleep(0.001)
+
+        thread = threading.Thread(target=server_loop, daemon=True)
+        thread.start()
     else:
-        R_transposed = R.transpose(1, 2)  # (N,3,3)
-        top_right = -torch.bmm(R_transposed, T)  # (N,3,1)
-        inverted_matrix = torch.eye(4, 4)[None].repeat(len(R), 1, 1)
-        inverted_matrix = inverted_matrix.to(R.dtype).to(R.device)
+        while True:
+            time.sleep(0.01)
 
-    inverted_matrix[:, :3, :3] = R_transposed
-    inverted_matrix[:, :3, 3:] = top_right
+    return server
 
-    return inverted_matrix
-
-def from_model(image_folder, model_path = None):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-
-    print("Initializing and loading VGGT model...")
-    # model = VGGT.from_pretrained("facebook/VGGT-1B")
-
-    model = VGGT()
-    if model_path is None:
-        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-    else:
-        model.load_state_dict(torch.load(model_path)["model_state_dict"])
-
-    model.eval()
-    model = model.to(device)
-
-    # Use the provided image folder path
-    print(f"Loading images from {image_folder}...")
-    image_names = glob.glob(os.path.join(image_folder, "*"))
-    image_names = [os.path.join(image_folder, image_name) for image_name in image_names if image_name.endswith(".png")]
-    image_names.sort()
-    image_names = image_names[:3]
-    print(f"Found {len(image_names)} images")
-
-    images = load_and_preprocess_images(image_names).to(device)
-
-    print(f"Preprocessed images shape: {images.shape}")
-
-    print("Running inference...")
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
-
-    print("Converting pose encoding to extrinsic and intrinsic matrices...")
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
-    predictions["extrinsic"] = extrinsic
-    predictions["intrinsic"] = intrinsic
-    
-    print("Processing model outputs...")
-    for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].squeeze(0)  # remove batch dimension and convert to numpy
-
-    return predictions
-
-def from_gt(gt_folder):
-    datasets = PairedDataset(gt_folder)
-    transformed_point_maps, transformed_cameras, rgb_images  = datasets[0]
-    keys = transformed_point_maps.keys()
-    keys = sorted(keys)
-    point_maps = []
-    cameras = []
-    rgb_images_list = []
-    for key in keys:
-        point_maps.append(transformed_point_maps[key])
-        cameras.append(transformed_cameras[key])
-        rgb_images_list.append(rgb_images[key])
-
-    point_maps = torch.stack(point_maps)
-    cameras = torch.stack(cameras)
-    rgb_images_list = torch.stack(rgb_images_list)
-    predictions = {
-        "world_points": point_maps[:3],
-        "extrinsic": cameras[:3],
-        "images": rgb_images_list[:3],
-    }
-    print("Processing model outputs...")
-    for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cuda()  # remove batch dimension and convert to numpy
-
-    return predictions
-
-def umeyama_similarity(P:torch.Tensor, Q:torch.Tensor):
-    """
-    Compute best‐fit rotation R, scale s, and translation t
-    such that:  Q ≈ s R P + t
-    P, Q: (N,3) arrays with known correspondence.
-    Returns R (3×3), s (scalar), t (3,).
-    """
-    assert P.shape == Q.shape
-    N = P.shape[0]
-
-    muP = P.mean(axis=0)
-    muQ = Q.mean(axis=0)
-    P0  = P - muP
-    Q0  = Q - muQ
-
-    C = (Q0.T @ P0) / N
-    U, Svals, Vt = torch.linalg.svd(C)
-    S = torch.eye(3).cuda()
-    if torch.linalg.det(U) * torch.linalg.det(Vt) < 0:
-        S[2,2] = -1
-    R = U @ S @ Vt
-
-    scale = (Svals * torch.diag(S)).sum() / torch.sum(P0**2)
-    t     = muQ - scale * (R @ muP)
-
-    return R, scale, t
-
-
-
-def save_ply(points, colors, filename):
-    points = points.cpu().numpy()
-    colors = colors.cpu().numpy()
-    colors = colors.reshape(-1, 3).astype('f4')
-    colors = colors * 255
-    colors = colors.astype('u1')
-
-    vertex_dtype = [
-        ('x',    'f4'),
-        ('y',    'f4'),
-        ('z',    'f4'),
-        ('red',   'u1'),
-        ('green', 'u1'),
-        ('blue',  'u1'),
-    ]
-
-    vertex_data = np.empty(points.shape[0], dtype=vertex_dtype)
-    vertex_data['x'] = points[:, 0]
-    vertex_data['y'] = points[:, 1]
-    vertex_data['z'] = points[:, 2]
-    vertex_data['red']   = colors[:, 0]
-    vertex_data['green'] = colors[:, 1]
-    vertex_data['blue']  = colors[:, 2]
-
-    ply_el = PlyElement.describe(vertex_data, name='vertex')
-    ply_data = PlyData([ply_el], text=False)  # text=False → binary
-    ply_data.write(filename)
-
-    print(f"Wrote binary PLY with positions+colors to {filename}")
-
-
-
-if __name__ == "__main__":
-
-    image_folder = "/home/bxiong/workspace/tile_mesh_rendering/camera/render_0000"
-    gt = from_gt("/home/bxiong/workspace/tile_mesh_rendering/camera/")
-    predictions = from_model(image_folder, model_path="/home/bxiong/workspace/vggt/model_save/best_model.pth")
-    #predictions = from_model(image_folder)
-
-    predictions = align_model_to_gt(predictions, gt)
-
-    print(gt["world_points"].shape, predictions["world_points"].shape)
-    print(gt["images"].shape, predictions["images"].shape)
-    save_ply(gt["world_points"].reshape(-1, 3), gt["images"].permute(0, 2, 3, 1).reshape(-1, 3), "gt.ply")
-    save_ply(predictions["world_points"].reshape(-1, 3), predictions["images"].permute(0, 2, 3, 1).reshape(-1, 3), "predictions.ply")
-    
 
 
 
