@@ -1,20 +1,69 @@
-import os
-import glob
 import time
 import threading
-import argparse
-from typing import List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
 from tqdm.auto import tqdm
 import viser
 import viser.transforms as viser_tf
-from vggt.utils.geometry import closed_form_inverse_se3
+
+P = torch.tensor([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]).cuda().to(torch.float32)
+
+def closed_form_inverse_se3(se3, R=None, T=None):
+    """
+    Compute the inverse of each 4x4 (or 3x4) SE3 matrix in a batch.
+
+    If `R` and `T` are provided, they must correspond to the rotation and translation
+    components of `se3`. Otherwise, they will be extracted from `se3`.
+
+    Args:
+        se3: Nx4x4 or Nx3x4 array or tensor of SE3 matrices.
+        R (optional): Nx3x3 array or tensor of rotation matrices.
+        T (optional): Nx3x1 array or tensor of translation vectors.
+
+    Returns:
+        Inverted SE3 matrices with the same type and device as `se3`.
+
+    Shapes:
+        se3: (N, 4, 4)
+        R: (N, 3, 3)
+        T: (N, 3, 1)
+    """
+    # Check if se3 is a numpy array or a torch tensor
+    is_numpy = isinstance(se3, np.ndarray)
+
+    # Validate shapes
+    if se3.shape[-2:] != (4, 4) and se3.shape[-2:] != (3, 4):
+        raise ValueError(f"se3 must be of shape (N,4,4), got {se3.shape}.")
+
+    # Extract R and T if not provided
+    if R is None:
+        R = se3[:, :3, :3]  # (N,3,3)
+    if T is None:
+        T = se3[:, :3, 3:]  # (N,3,1)
+
+    # Transpose R
+    if is_numpy:
+        # Compute the transpose of the rotation for NumPy
+        R_transposed = np.transpose(R, (0, 2, 1))
+        # -R^T t for NumPy
+        top_right = -np.matmul(R_transposed, T)
+        inverted_matrix = np.tile(np.eye(4), (len(R), 1, 1))
+    else:
+        R_transposed = R.transpose(1, 2)  # (N,3,3)
+        top_right = -torch.bmm(R_transposed, T)  # (N,3,1)
+        inverted_matrix = torch.eye(4, 4)[None].repeat(len(R), 1, 1)
+        inverted_matrix = inverted_matrix.to(R.dtype).to(R.device)
+
+    inverted_matrix[:, :3, :3] = R_transposed
+    inverted_matrix[:, :3, 3:] = top_right
+
+    return inverted_matrix
 
 
 def viser_wrapper(
-    pred_dict: dict,
+    pred_dict: Dict[str, torch.Tensor],
     port: int = 8080,
     background_mode: bool = False,
 ):
@@ -41,35 +90,47 @@ def viser_wrapper(
     """
     print(f"Starting viser server on port {port}")
 
+
     server = viser.ViserServer(host="0.0.0.0", port=port)
     server.gui.configure_theme(titlebar_content=None, control_layout="collapsible")
 
     # Unpack prediction dict
     images = pred_dict["images"]  # (S, 3, H, W)
     world_points_map = pred_dict["world_points"]  # (S, H, W, 3)
-
     extrinsics_cam = pred_dict["extrinsic"]  # (S, 3, 4)
+    if len(images.shape) == 5:
+        images = images.squeeze(0)
+    if len(world_points_map.shape) == 5:
+        world_points_map = world_points_map.squeeze(0)
+    if len(extrinsics_cam.shape) == 4:
+        extrinsics_cam = extrinsics_cam.squeeze(0).cpu().numpy()
+
+
 
     # Compute world points from depth if not using the precomputed point map
 
-    world_points = world_points_map
+    world_points:torch.Tensor = world_points_map
 
     # Convert images from (S, 3, H, W) to (S, H, W, 3)
     # Then flatten everything for the point cloud
-    colors = images.transpose(0, 2, 3, 1)  # now (S, H, W, 3)
+    colors = images.permute(0, 2, 3, 1)  # now (S, H, W, 3)
     S, H, W, _ = world_points.shape
 
     # Flatten
     points = world_points.reshape(-1, 3)
-    colors_flat = (colors.reshape(-1, 3) * 255).astype(np.uint8)
+    colors_flat = (colors.reshape(-1, 3) * 255).to(torch.uint8)
 
     cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) typically
+    R = cam_to_world_mat[:,:3,:3]
+    R = R@P.unsqueeze(0)
+    cam_to_world_mat[:,:3,:3] = R
+    cam_to_world_mat = cam_to_world_mat.cpu().numpy()
     # For convenience, we store only (3,4) portion
     cam_to_world = cam_to_world_mat[:, :3, :]
 
     # Compute scene center and recenter
-    scene_center = np.mean(points, axis=0)
-    points_centered = points - scene_center
+    scene_center = np.mean(points.cpu().numpy(), axis=0)
+    points_centered = points.cpu().numpy() - scene_center
     cam_to_world[..., -1] -= scene_center
 
     # Store frame indices so we can filter by frame
@@ -88,7 +149,7 @@ def viser_wrapper(
     point_cloud = server.scene.add_point_cloud(
         name="viser_pcd",
         points=points_centered,
-        colors=colors_flat,
+        colors=colors_flat.cpu().numpy(),
         point_size=0.001,
         point_shape="circle",
     )
@@ -178,7 +239,7 @@ def viser_wrapper(
             fr.visible = gui_show_frames.value
 
     # Add the camera frames to the scene
-    visualize_frames(cam_to_world, images)
+    visualize_frames(cam_to_world, images.cpu().numpy())
 
     print("Starting viser server...")
     # If background_mode is True, spawn a daemon thread so the main thread can continue.
