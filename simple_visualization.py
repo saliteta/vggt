@@ -10,15 +10,13 @@ from tqdm.auto import tqdm
 from vggt.models.vggt import VGGT
 
 from mesh_loader.simple_data_loader import PairedDataset
-from mesh_loader.alignment import align_model_to_gt
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 import argparse
 from pathlib import Path
 
 import open3d as o3d
-from mesh_loader.visualizer import viser_wrapper
+from mesh_loader.visualizer import Visualizer, VisualizerData
 
-P = torch.tensor([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]).cuda().to(torch.float32)
 
 def visualize_point_clouds_with_extrinsics(
     gt_pts: torch.Tensor,
@@ -90,7 +88,7 @@ def visualize_point_clouds_with_extrinsics(
 def arg_parse():
     parser = argparse.ArgumentParser()
     parser.add_argument("--eval_dir", type=str, default="/media/bxiong/data/bingData/eval")
-    parser.add_argument("--model_path", type=str, default="/media/bxiong/data/bing_model/best_model.pth")
+    parser.add_argument("--model_path", type=str, default="model_save/best_model.pth")
     return parser.parse_args()
 
 def main():
@@ -100,7 +98,7 @@ def main():
 
 
     # Dataset and DataLoader
-    val_dataset = PairedDataset(dataset_dir,num_images=5)
+    val_dataset = PairedDataset(dataset_dir,num_images=3)
 
     val_loader = DataLoader(val_dataset,
                             batch_size=1,
@@ -111,9 +109,9 @@ def main():
     print(f"len(val_loader): {len(val_loader)}")
     # Model
     model = VGGT()
-    #model.load_state_dict(torch.load(args.model_path, map_location=device)["model_state_dict"])
-    URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(URL, map_location=device))
+    model.load_state_dict(torch.load(args.model_path, map_location=device)["model_state_dict"])
+    #URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    #model.load_state_dict(torch.hub.load_state_dict_from_url(URL, map_location=device))
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     model.eval()
     model = model.to(device)
@@ -146,14 +144,22 @@ def main():
             extrinsic_4x4 = torch.cat([extrinsic_3x4, bottom_row], dim=1)  # (5, 4, 4)
             preds["extrinsic"] = extrinsic_4x4
 
-            blended = {
-                "images": torch.cat([gt["images"].squeeze(0), preds["images"].squeeze(0)], dim=0),
-                "extrinsic": torch.cat([gt["extrinsic"], preds["extrinsic"]], dim=0),
-                "world_points": torch.cat([gt["world_points"], preds["world_points"]], dim=0),
-            }
+            gt_data = VisualizerData(
+                images=gt["images"],
+                world_points=gt["world_points"],
+                extrinsic=gt["extrinsic"],
+                intrinsic=None,
+            )
+            pred_data = VisualizerData(
+                images=preds["images"],
+                world_points=preds["world_points"],
+                extrinsic=preds["extrinsic"],
+                intrinsic=None,
+            )
+            visualizer = Visualizer(gt_data, pred_data)
+            visualizer.run()
 
 
-            viser_wrapper(blended)
 
 
 

@@ -10,7 +10,6 @@ from tqdm.auto import tqdm
 from vggt.models.vggt import VGGT
 
 from mesh_loader.simple_data_loader import PairedDataset
-from mesh_loader.alignment import align_model_to_gt
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 import datetime
 import argparse
@@ -25,9 +24,9 @@ except ImportError:
 
 def arg_parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir", type=str, default="/media/bxiong/c6deb427-f841-4fb3-8707-2d0593655c63/bingMap")
+    parser.add_argument("--dataset_dir", type=str, default="/media/bxiong/data/bingData")
     parser.add_argument("--sequence_length", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=4e-5)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
     return parser.parse_args()
 
 
@@ -86,7 +85,7 @@ def main():
     criterion = nn.MSELoss()
 
     best_val_loss = float('inf')
-    for epoch in range(1, 100 + 1):
+    for epoch in range(1, 2):
         running_loss = 0.0
         model.train()
         for point_maps, camera_params, rgb_images in tqdm(train_loader, desc=f"Epoch {epoch}"):
@@ -103,9 +102,8 @@ def main():
             predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
             preds["extrinsic"] = predict_extrinsics.squeeze(0)
             preds["world_points"] = preds["world_points"].squeeze(0)
-            preds = align_model_to_gt(preds, gt)
-            loss_pose = criterion(preds["extrinsic"], gt["extrinsic"])
-            loss_pts  = criterion(preds["world_points"], gt["world_points"].reshape(-1, 3))
+            loss_pose = criterion(preds["extrinsic"][:,:3,:], gt["extrinsic"][:,:3,:])
+            loss_pts  = criterion(preds["world_points"], gt["world_points"])
             loss = loss_pose + loss_pts
             loss.backward()
             optimizer.step()
@@ -132,9 +130,8 @@ def main():
                 predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
                 preds["extrinsic"] = predict_extrinsics.squeeze(0)
                 preds["world_points"] = preds["world_points"].squeeze(0)    
-                preds = align_model_to_gt(preds, gt)
-                loss_pose = criterion(preds["extrinsic"], gt["extrinsic"])
-                loss_pts  = criterion(preds["world_points"], gt["world_points"].reshape(-1, 3))
+                loss_pose = criterion(preds["extrinsic"][:,:3,:], gt["extrinsic"][:,:3,:])
+                loss_pts  = criterion(preds["world_points"], gt["world_points"])
                 loss = loss_pose + loss_pts
                 running_loss += loss.item() * gt["images"].size(0)
             val_loss = running_loss / len(val_dataset)
