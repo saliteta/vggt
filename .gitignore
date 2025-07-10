@@ -151,3 +151,4 @@ skyseg.onnx
 
 wandb/
 official_dataset_example/
+model_save/
