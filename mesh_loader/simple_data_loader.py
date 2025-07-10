@@ -10,50 +10,8 @@ from typing import Dict, List, Tuple
 import tifffile as tif
 import random
 
-M = torch.diag(torch.tensor([1, -1, 1])) 
 
-
-def pytorch3d_to_colmap_batch(camera_params: torch.Tensor,
-                              point_maps: torch.Tensor,
-                              rgb_images: torch.Tensor
-                              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Batch‐wise conversion from PyTorch3D conventions to COLMAP conventions:
-      - camera_params: (B, 4, 4) world→camera transforms in PyTorch3D coords
-      - point_maps:    (B, H, W, 3) 3D point coordinates in PyTorch3D world
-      - rgb_images:    (B, H, W, 3) RGB images (unchanged)
-    Returns:
-      - T_colmap:      (B, 4, 4) world→camera transforms in COLMAP/OpenCV coords
-      - point_maps:    (B, H, W, 3) rotated point maps in COLMAP coords
-      - rgb_images:    unchanged
-    """
-    device = camera_params.device
-    dtype = camera_params.dtype
-    B, H, W, _ = point_maps.shape
-
-    # 1) Define the Y‐axis flip matrix (PyTorch3D Y‐up → COLMAP Y‐down)
-    M3 = torch.diag(torch.tensor([1, -1, 1], dtype=dtype, device=device))
-
-    # 2) Extract R and t from the 4×4 transforms
-    R_py3d = camera_params[:, :3, :3]  # (B, 3, 3)
-    t_py3d = camera_params[:, :3, 3]   # (B, 3)
-
-    # 3) Convert each: R_colmap = M3 @ R_py3d @ M3, t_colmap = M3 @ t_py3d
-    R_colmap = M3 @ R_py3d @ M3  # broadcast M3 over batch
-    t_colmap = (M3 @ t_py3d.unsqueeze(-1)).squeeze(-1)  # (B,3)
-
-    # 4) Build full 4×4 COLMAP transforms
-    T_colmap = torch.eye(4, dtype=dtype, device=device)\
-        .unsqueeze(0).repeat(B, 1, 1)   # (B,4,4)
-    T_colmap[:, :3, :3] = R_colmap
-    T_colmap[:, :3, 3]    = t_colmap
-
-    # 5) Rotate point maps by M3
-    pts_flat = point_maps.reshape(-1, 3).T     # (3, B*H*W)
-    pts_rot  = (M3 @ pts_flat).T               # (B*H*W, 3)
-    pts_new  = pts_rot.reshape(B, H, W, 3)     # (B, H, W, 3)
-
-    return pts_new, T_colmap, rgb_images
+P = torch.tensor([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]).to(torch.float32)
 
 
 class PairedDataset(Dataset):
@@ -82,7 +40,7 @@ class PairedDataset(Dataset):
         for camera in camera_data["cameras"]:
             # Create 4x4 transformation matrix
             transform_matrix = torch.tensor(camera["full_transform"])
-            
+            transform_matrix = transform_matrix @ P
             # Use image filename as key
             camera_transforms[camera["image_filename"].split(".")[0]] = transform_matrix
             
@@ -105,10 +63,9 @@ class PairedDataset(Dataset):
             aligned_points.append(cam0.reshape(H, W, 3))
             all_pts.append(cam0)
 
-
         # 2) Compute scale:
         all_pts = torch.cat(all_pts, dim=0)
-        max_dist = all_pts.norm(dim=1).max()
+        max_dist = all_pts.norm(dim=1).max() - all_pts.norm(dim=1).min()
 
         # 3) Scale point-maps and camera translations:
         for i in range(len(aligned_points)):
@@ -129,7 +86,8 @@ class PairedDataset(Dataset):
         for path in rgb_image_path:
             rgb_image = Image.open(str(path))
             rgb_image_tensor = torch.from_numpy(np.array(rgb_image))
-            rgb_images.append(rgb_image_tensor[:,:,:3].permute(2,0,1) / 255.0) # remove alpha channel
+            rgb_tensor = rgb_image_tensor[:,:,:3].permute(2,0,1) / 255.0
+            rgb_images.append(rgb_tensor) # remove alpha channel
         return torch.stack(rgb_images)
 
     def __len__(self):
@@ -161,7 +119,6 @@ class PairedDataset(Dataset):
         camera_params = torch.stack([camera_params[k] for k in camera_keys])
 
 
-        # Transform everything to use first camera as reference coordinate system
 
         transformed_cameras, transformed_point_maps = self._transform_to_first_camera_coordinates(camera_params, point_maps)
         if self.data_conversion == None:
@@ -212,17 +169,3 @@ def from_gt(transformed_point_maps, transformed_cameras, rgb_images):
             gt[key] = gt[key].cuda()  # remove batch dimension and convert to numpy
 
     return gt
-
-
-if __name__ == "__main__":
-    dataset = PairedDataset(Path("/media/bxiong/c6deb427-f841-4fb3-8707-2d0593655c63/bingMap/train"), data_conversion=pytorch3d_to_colmap_batch)
-
-    point_maps, camera_params, rgb_images = dataset[0]
-    print(camera_params)
-    preds = {
-        "world_points": point_maps.cpu().numpy(),
-        "extrinsic": camera_params.cpu().numpy(),
-        "images": rgb_images.cpu().numpy(),
-    }
-    from visualizer import viser_wrapper
-    viser_wrapper(preds)

@@ -8,7 +8,6 @@ from tqdm.auto import tqdm
 import viser
 import viser.transforms as viser_tf
 
-P = torch.tensor([[-1, 0, 0], [0, -1, 0], [0, 0, 1]]).cuda().to(torch.float32)
 
 def closed_form_inverse_se3(se3, R=None, T=None):
     """
@@ -121,9 +120,6 @@ def viser_wrapper(
     colors_flat = (colors.reshape(-1, 3) * 255).to(torch.uint8)
 
     cam_to_world_mat = closed_form_inverse_se3(extrinsics_cam)  # shape (S, 4, 4) typically
-    R = cam_to_world_mat[:,:3,:3]
-    R = R@P.unsqueeze(0)
-    cam_to_world_mat[:,:3,:3] = R
     cam_to_world_mat = cam_to_world_mat.cpu().numpy()
     # For convenience, we store only (3,4) portion
     cam_to_world = cam_to_world_mat[:, :3, :]

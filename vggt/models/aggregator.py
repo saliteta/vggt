@@ -14,6 +14,7 @@ from vggt.layers import PatchEmbed
 from vggt.layers.block import Block
 from vggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from vggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from torch.utils.checkpoint import checkpoint
 
 logger = logging.getLogger(__name__)
 

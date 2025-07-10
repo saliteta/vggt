@@ -12,13 +12,13 @@ from vggt.models.vggt import VGGT
 from mesh_loader.simple_data_loader import PairedDataset
 from mesh_loader.alignment import align_model_to_gt
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-import datetime
 import argparse
 from pathlib import Path
 
 import open3d as o3d
-import numpy as np
+from mesh_loader.visualizer import viser_wrapper
 
+P = torch.tensor([[-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]).cuda().to(torch.float32)
 
 def visualize_point_clouds_with_extrinsics(
     gt_pts: torch.Tensor,
@@ -111,9 +111,9 @@ def main():
     print(f"len(val_loader): {len(val_loader)}")
     # Model
     model = VGGT()
-    model.load_state_dict(torch.load(args.model_path, map_location=device)["model_state_dict"])
-    #URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    #model.load_state_dict(torch.hub.load_state_dict_from_url(URL, map_location=device))
+    #model.load_state_dict(torch.load(args.model_path, map_location=device)["model_state_dict"])
+    URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    model.load_state_dict(torch.hub.load_state_dict_from_url(URL, map_location=device))
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     model.eval()
     model = model.to(device)
@@ -132,34 +132,28 @@ def main():
             predict_extrinsics, _ = pose_encoding_to_extri_intri(preds['pose_enc'], gt["images"].shape[-2:])
             preds["extrinsic"] = predict_extrinsics.squeeze(0)
             preds["world_points"] = preds["world_points"].squeeze(0)    
-            #preds = align_model_to_gt(preds, gt)
 
-            print(preds["extrinsic"][:,:3,:].shape)
-            print(gt["extrinsic"][:,:3,:].shape)
-            print(preds["world_points"].shape)
-            print(gt["world_points"].shape)
-            exit()
 
-            # Create colors for visualization
-            num_points = preds["world_points"].reshape(-1,3).shape[0]
-            color = gt["images"].squeeze(0).permute(0,2,3,1).reshape(-1,3)
-            gt_colors = torch.ones(num_points, 3).to(device) * torch.tensor([0.0, 1.0, 0.0]).to(device)# Green for GT
-            pred_colors = torch.ones(num_points, 3).to(device) * torch.tensor([1.0, 0.0, 0.0]).to(device)  # Red for prediction
-            gt_colors = 0.1*gt_colors+ color*0.9 # Green for GT
-            pred_colors = 0.1*pred_colors+ color*0.9 # Red for prediction
-            gt_colors = gt_colors.cpu()
-            pred_colors = pred_colors.cpu()
-            
-            # Visualize the comparison
-            visualize_point_clouds_with_extrinsics(
-                gt_pts=gt["world_points"],
-                pred_pts=preds["world_points"],
-                gt_extrinsics=gt["extrinsic"],
-                pred_extrinsics=preds["extrinsic"],
-                gt_colors=gt_colors,
-                pred_colors=pred_colors,
-                frame_size=0.1
-            )
+            # INSERT_YOUR_CODE
+            # Suppose you have a tensor of shape (5, 3, 4), e.g. gt["extrinsic"]
+            # You want to extend it to (5, 4, 4) and set the last row to [0, 0, 0, 1]
+            extrinsic_3x4 = preds["extrinsic"]  # shape (5, 3, 4)
+            batch_size = extrinsic_3x4.shape[0]
+            # Create the bottom row [0, 0, 0, 1] for each batch
+            bottom_row = torch.tensor([0, 0, 0, 1], dtype=extrinsic_3x4.dtype, device=extrinsic_3x4.device)
+            bottom_row = bottom_row.unsqueeze(0).repeat(batch_size, 1).unsqueeze(1)  # (5, 1, 4)
+            # Concatenate along the first dimension (rows)
+            extrinsic_4x4 = torch.cat([extrinsic_3x4, bottom_row], dim=1)  # (5, 4, 4)
+            preds["extrinsic"] = extrinsic_4x4
+
+            blended = {
+                "images": torch.cat([gt["images"].squeeze(0), preds["images"].squeeze(0)], dim=0),
+                "extrinsic": torch.cat([gt["extrinsic"], preds["extrinsic"]], dim=0),
+                "world_points": torch.cat([gt["world_points"], preds["world_points"]], dim=0),
+            }
+
+
+            viser_wrapper(blended)
 
 
 
